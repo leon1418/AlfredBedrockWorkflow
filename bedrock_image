@@ -1,0 +1,209 @@
+#!/usr/bin/osascript -l JavaScript
+
+// Constants
+const MAX_WAIT_TIME = 30; // seconds
+const CHECK_INTERVAL = 0.5; // seconds
+const MAX_ENTRIES = 10;
+const FILE_EXTENSION = '.png';
+
+// Cache for frequently used objects
+const NSFileManager = $.NSFileManager.defaultManager;
+const processInfo = $.NSProcessInfo.processInfo;
+
+// Helpers
+function envVar(varName) {
+    return processInfo.environment.objectForKey(varName)?.js;
+}
+
+function isDir(path) {
+    const attrs = NSFileManager.attributesOfItemAtPathError(path, undefined);
+    return attrs?.js["NSFileType"]?.js === "NSFileTypeDirectory";
+}
+
+function makeDir(path) {
+    return NSFileManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(
+        path, true, undefined, undefined);
+}
+
+function dirContents(path) {
+    const contents = NSFileManager.contentsOfDirectoryAtURLIncludingPropertiesForKeysOptionsError(
+        $.NSURL.fileURLWithPath(path),
+        undefined,
+        $.NSDirectoryEnumerationSkipsHiddenFiles,
+        undefined
+    );
+    return contents?.js.map(p => p.path.js).sort() || [];
+}
+
+function extractPrompt(path) {
+    const task = $.NSTask.alloc.init;
+    const stdout = $.NSPipe.pipe;
+
+    task.executableURL = $.NSURL.fileURLWithPath("/usr/bin/xattr");
+    task.arguments = ["-p", "com.apple.metadata:kMDItemDescription", path];
+    task.standardOutput = stdout;
+    
+    try {
+        task.launchAndReturnError(false);
+        const dataOut = stdout.fileHandleForReading.readDataToEndOfFileAndReturnError(false);
+        const stringOut = $.NSPropertyListSerialization.propertyListWithDataOptionsFormatError(
+            dataOut, [], undefined, undefined
+        )?.js;
+
+        if (!stringOut) return "**No prompt found**";
+
+        const promptRegex = /^(\w+ Prompt:)/;
+        return stringOut
+            .split("\n")
+            .filter(line => line.match(promptRegex))
+            .map(line => line.replace(promptRegex, "**$1**"))
+            .join("\n\n");
+    } catch (error) {
+        console.log(`Error extracting prompt: ${error}`);
+        return "**Error extracting prompt**";
+    }
+}
+
+function writeMetadata(field, text, path) {
+    try {
+        const plistData = $.NSPropertyListSerialization.dataWithPropertyListFormatOptionsError(
+            text, $.NSPropertyListXMLFormat_v1_0, 0, undefined
+        );
+        const plistString = $.NSString.alloc.initWithDataEncoding(
+            plistData, $.NSUTF8StringEncoding
+        ).js;
+
+        const task = $.NSTask.alloc.init;
+        task.executableURL = $.NSURL.fileURLWithPath("/usr/bin/xattr");
+        task.arguments = ["-w", `com.apple.metadata:${field}`, plistString, path];
+        task.launchAndReturnError(false);
+    } catch (error) {
+        console.log(`Error writing metadata: ${error}`);
+    }
+}
+
+function padDate(number) {
+    return number.toString().padStart(2, "0");
+}
+
+function markdownImage(path) {
+    return `${extractPrompt(path)}\n![](${path})`;
+}
+
+function generateUniqueFilename() {
+    const date = new Date();
+    const timestamp = [
+        date.getFullYear(),
+        padDate(date.getMonth() + 1),
+        padDate(date.getDate()),
+        padDate(date.getHours()),
+        padDate(date.getMinutes()),
+        padDate(date.getSeconds())
+    ].join('.');
+    
+    const uniqueId = processInfo.globallyUniqueString.js.split("-")[0];
+    return `${timestamp}-${uniqueId}${FILE_EXTENSION}`;
+}
+
+function waitForFile(filePath, maxWaitTime = MAX_WAIT_TIME) {
+    const maxAttempts = maxWaitTime / CHECK_INTERVAL;
+    let attempts = 0;
+
+    while (attempts < maxAttempts) {
+        if (NSFileManager.fileExistsAtPath(filePath)) {
+            console.log("File generated successfully");
+            return true;
+        }
+
+        $.NSThread.sleepForTimeInterval(CHECK_INTERVAL);
+        console.log(`Waiting... (${++attempts}/${maxAttempts})`);
+    }
+
+    throw new Error(`Timeout after ${maxWaitTime}s waiting for file generation`);
+}
+
+function validateInputs(typedQuery, parentFolder) {
+    if (!typedQuery?.trim()) {
+        throw new Error("Query cannot be empty");
+    }
+    if (!parentFolder) {
+        throw new Error("Output folder not specified");
+    }
+}
+
+// Main
+function run(argv) {
+    try {
+        const typedQuery = argv[0];
+        const modelId = envVar("stable_diffusion_model");
+        // const awsAccount = envVar("aws_account")
+        const awsRegion = envVar("aws_region")
+        const pythonPath = envVar("python_path")
+        const stylePreset = envVar("stable_diffusion_style_preset");
+        const seed = envVar("stable_diffusion_seed")?.toLowerCase() === "null" ? "null" : 
+                    Number(envVar("stable_diffusion_seed")) || "null";
+        const parentFolder = envVar("stable_diffusion_images_folder");
+
+        //validateInputs(typedQuery, parentFolder);
+        makeDir(parentFolder);
+
+        // Handle previous entries loading
+        if (!envVar("loaded_previous")) {
+            const previousEntries = dirContents(parentFolder)
+                .filter(entry => !isDir(entry) && entry.endsWith(FILE_EXTENSION))
+                .slice(-MAX_ENTRIES)
+                .map(markdownImage)
+                .join("\n\n");
+
+            return JSON.stringify({
+                rerun: 0.1,
+                variables: { loaded_previous: true },
+                response: previousEntries,
+                behaviour: { scroll: "end" }
+            });
+        }
+
+        // Return previous entries if query is empty
+        if (!typedQuery.trim()) {
+            const previousEntries = dirContents(parentFolder)
+                .filter(entry => !isDir(entry) && entry.endsWith(FILE_EXTENSION))
+                .slice(-MAX_ENTRIES)
+                .map(markdownImage)
+                .join("\n\n");
+
+            return JSON.stringify({
+                variables: { loaded_previous: true },
+                response: previousEntries,
+                behaviour: { scroll: "end" }
+            });
+        }
+
+        // Generate new image
+        const outputFile = `${parentFolder}/${generateUniqueFilename()}`;
+        const task = $.NSTask.alloc.init;
+        const stdout = $.NSPipe.pipe;
+
+        task.executableURL = $.NSURL.fileURLWithPath(pythonPath);
+        task.arguments = ["./bedrock_image.py", typedQuery, awsRegion, outputFile, modelId, seed, stylePreset];
+        
+        task.standardOutput = stdout;
+        task.launchAndReturnError(false);
+
+        waitForFile(outputFile);
+        writeMetadata("kMDItemDescription", `Original Prompt: ${typedQuery}`, outputFile);
+
+        return JSON.stringify({
+            variables: { loaded_previous: true },
+            response: markdownImage(outputFile),
+            behaviour: { response: "append" }
+        });
+
+    } catch (error) {
+        console.log(`Error: ${error.message}`);
+        return JSON.stringify({
+            variables: { loaded_previous: true },
+            response: `Error: ${error.message}`,
+            behaviour: { response: "append" }
+        });
+    }
+}

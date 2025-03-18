@@ -1,0 +1,278 @@
+#!/usr/bin/osascript -l JavaScript
+
+// Helpers
+function envVar(varName) {
+  return $.NSProcessInfo
+    .processInfo
+    .environment
+    .objectForKey(varName).js
+}
+
+function fileExists(path) {
+  return $.NSFileManager.defaultManager.fileExistsAtPath(path)
+}
+
+function fileModified(path) {
+  return $.NSFileManager.defaultManager
+    .attributesOfItemAtPathError(path, undefined)
+    .js["NSFileModificationDate"].js
+    .getTime()
+}
+
+function deleteFile(path) {
+  return $.NSFileManager.defaultManager.removeItemAtPathError(path, undefined)
+}
+
+function writeFile(path, text) {
+  $(text).writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, undefined)
+}
+
+function readChat(path) {
+  const chatString = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, undefined).js
+  return JSON.parse(chatString)
+}
+
+function appendChat(path, message) {
+  const ongoingChat = readChat(path).concat(message)
+  const chatString = JSON.stringify(ongoingChat)
+  writeFile(path, chatString)
+}
+
+function markdownChat(messages, ignoreLastInterrupted = true) {
+  return messages.reduce((accumulator, current, index, allMessages) => {
+    if (current["role"] === "assistant")
+      return `${accumulator}${current["content"]}\n\n`
+
+    if (current["role"] === "user") {
+      const userMessage = current["content"].split("\n").map(line => `### ${line}`).join("\n") // support multi-line questions (e.g. via External Trigger)
+      const userTwice = allMessages[index + 1]?.["role"] === "user" // "user" role twice in a row
+      const lastMessage = index === allMessages.length - 1 // "user is last message
+
+      return userTwice || (lastMessage && !ignoreLastInterrupted) ?
+        `${accumulator}${userMessage}\n\n[Answer Interrupted]\n\n` :
+        `${accumulator}${userMessage}\n\n`
+    }
+
+    // Ignore any other role
+    return accumulator
+  }, "")
+}
+
+function startStream(awsAccount, awsRegion, pythonPath, modelId, knowledgeBaseId, systemPrompt, contextChat, streamFile, pidStreamFile, withRGA, withFileInput) {
+  // create empty file
+  $.NSFileManager.defaultManager.createFileAtPathContentsAttributes(streamFile, undefined, undefined)
+
+  // Create Json message
+  const messages = systemPrompt ?
+    [{ role: "system", content: systemPrompt }].concat(contextChat) :
+    contextChat
+  const messagesJSON = JSON.stringify(messages)
+
+  const task = $.NSTask.alloc.init
+  const stdout = $.NSPipe.pipe
+
+  // Config python inputs
+  task.executableURL = $.NSURL.fileURLWithPath(pythonPath)
+  task.arguments = [
+    "./bedrock_stream.py",
+    messagesJSON,
+    awsAccount,
+    awsRegion,
+    withRGA,
+    streamFile,
+    modelId,
+    knowledgeBaseId,
+    withFileInput
+  ]
+
+  // Connect the stdout to the file
+  const outputFileHandle = $.NSFileHandle.fileHandleForWritingAtPath(streamFile)
+  task.standardOutput = outputFileHandle
+
+  // run task
+  const error = $.NSError.alloc.init
+  const success = task.launchAndReturnError(error)
+
+  if (!success) {
+    console.log("Job start failed:", error.localizedDescription.js)
+    outputFileHandle.close()
+    return
+  }
+
+  // Record pid and close
+  writeFile(pidStreamFile, task.processIdentifier.toString())
+
+}
+
+function readStream(streamFile, chatFile, pidStreamFile) {
+  const streamMarker = envVar("stream_marker") === "1"
+  const streamString = $.NSString.stringWithContentsOfFileEncodingError(streamFile, $.NSUTF8StringEncoding, undefined).js
+
+  // When starting a stream or continuing from a closed window, add a marker to determine the location of future replacements
+  if (streamMarker) return JSON.stringify({
+    rerun: 0.1,
+    variables: { streaming_now: true },
+    response: "…",
+    behaviour: { response: "append" }
+  })
+
+  // If response looks like proper JSON, it is probably an error
+  if (streamString.startsWith("{")) {
+    try {
+      const errorMessage = JSON.parse(streamString)["error"]["message"]
+
+      if (errorMessage) {
+        // Delete stream files
+        deleteFile(streamFile)
+        deleteFile(pidStreamFile)
+
+        return JSON.stringify({
+          response: `[${errorMessage}]`, // Surround in square brackets to look like other errors
+          behaviour: { response: "replacelast" }
+        })
+      }
+
+      throw "Could not determine error message" // Fallback to the catch
+    } catch {
+      // If it's not an error from the API, log file contents
+      console.log(streamString)
+
+      return JSON.stringify({
+        response: streamString,
+        behaviour: { response: "replacelast" }
+      })
+    }
+  }
+
+  // Parse streaming response
+  const chunks = streamString
+    .split("\n") // Split into lines
+    .filter(item => item) // Remove empty lines
+    .map(item => item.replace(/^data: /, "")) // Remove extraneous "data: "
+    .flatMap(item => { try { return JSON.parse(item) } catch { return [] } }) // Parse as JSON
+
+  const responseText = chunks.map(item => item["choices"][0]?.["delta"]["content"]).join("")
+
+  // If File not modified for over 20 seconds, connection stalled
+  const stalled = new Date().getTime() - fileModified(streamFile) > 20000
+
+  if (stalled) {
+    // Write incomplete response
+    if (responseText.length > 0) appendChat(chatFile, { role: "assistant", content: responseText })
+ 
+    // Delete stream files
+    deleteFile(streamFile)
+    deleteFile(pidStreamFile)
+
+    // Stop
+    return JSON.stringify({
+      response: `${responseText} [Connection Stalled]`,
+      footer: "You can ask Deepseel to continue the answer",
+      behaviour: { response: "replacelast", scroll: "end" }
+    })
+  }
+
+  // If file is empty, we were too fast and will try again on next loop
+  if (streamString.length === 0) return JSON.stringify({
+    rerun: 0.1,
+    variables: { streaming_now: true }
+  })
+
+  // Last token finish reason
+  const finishReason = chunks.slice(-1)[0]["choices"][0]["finish_reason"]
+
+  // If reponse is not finished, continue loop
+  if (!finishReason) return JSON.stringify({
+    rerun: 0.1,
+    variables: { streaming_now: true },
+    response: responseText,
+    behaviour: { response: "replacelast", scroll: "end" }
+  })
+
+  // When finished, write history and delete stream files
+  appendChat(chatFile, { role: "assistant", content: responseText })
+
+  deleteFile(streamFile)
+  deleteFile(pidStreamFile)
+
+  // Mention finish reason in footer
+  const footerText = (function() {
+    switch (finishReason) {
+      case "legth": return "Maximum number of tokens reached"
+      case "content_filter": return "Content was omitted due to a flag from OpenAI content filters"
+    }
+  })()
+
+  // Stop
+  return JSON.stringify({
+    response: responseText,
+    footer: footerText,
+    behaviour: { response: "replacelast", scroll: "end" }
+  })
+}
+
+// Main
+function run(argv) {
+  // Constant data
+  const withRGA = argv[0].startsWith('~') ? '1' : '0'; 
+  const typedQuery = withRGA === '1' ? argv[0].substring(1) : argv[0];
+  const maxContext = parseInt(envVar("max_context"))
+  const systemPrompt = envVar("system_prompt")
+  const awsAccount = envVar("aws_account")
+  const awsRegion = envVar("aws_region")
+  const pythonPath = envVar("python_path")
+  const modelId = envVar("bedrock_model")
+  const knowledgeBaseId = envVar("bedrock_knowledge_base_id")
+  const chatFile = `${envVar("alfred_workflow_data")}/chat.json`
+  const pidStreamFile = `${envVar("alfred_workflow_cache")}/pid.txt`
+  const streamFile = `${envVar("alfred_workflow_cache")}/stream.txt`
+  const streamingNow = envVar("streaming_now") === "1"
+  // Set withFileInput to false if undefined
+  let withFileInput = envVar('bedrock_file_input');
+  if (withFileInput === '1') {
+      const fileExists = $.NSFileManager.defaultManager.fileExistsAtPath(typedQuery);
+      if (!fileExists) {
+          withFileInput = '0';
+      }
+  }
+  // Set default if undefined
+  if (withFileInput === undefined || withFileInput === null) {
+      withFileInput = 'false';
+  }
+
+  // If continually reading from a stream, continue that loop
+  if (streamingNow) return readStream(streamFile, chatFile, pidStreamFile)
+
+  // Load previous conversation
+  const previousChat = readChat(chatFile)
+
+  // If "streaming_now" is unset but stream file exists, the window was closed mid-stream
+  // Reload conversation and rerun to resume stream
+  if (fileExists(streamFile)) return JSON.stringify({
+    rerun: 0.1,
+    variables: { streaming_now: true, stream_marker: true },
+    response: markdownChat(previousChat, true),
+    behaviour: { scroll: "end" }
+  })
+
+  // If argument is empty, return previous conversation
+  if (typedQuery.length === 0) return JSON.stringify({
+    response: markdownChat(previousChat, false),
+    behaviour: { scroll: "end" }
+  })
+
+  // Append new question to chat
+  const appendQuery = { role: "user", content: typedQuery }
+  const ongoingChat = previousChat.concat(appendQuery)
+  const contextChat = ongoingChat.slice(-maxContext)
+
+  // Make API request, write chat file, and start loop
+  startStream(awsAccount, awsRegion, pythonPath, modelId, knowledgeBaseId, systemPrompt, contextChat, streamFile, pidStreamFile, withRGA, withFileInput)
+  appendChat(chatFile, appendQuery)
+  
+  return JSON.stringify({
+    rerun: 0.1,
+    variables: { streaming_now: true, stream_marker: true },
+    response: markdownChat(ongoingChat)
+  })
+}
